@@ -1,0 +1,708 @@
+package com.mdblisthub.tv.ui.player
+
+import com.mdblisthub.tv.core.network.NetworkMeter
+import com.mdblisthub.tv.torrent.TorrentStreaming
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.mdblisthub.tv.core.data.DataGraph
+import com.mdblisthub.tv.core.data.mapper.Languages
+import com.mdblisthub.tv.core.data.mapper.SubtitleMatcher
+import com.mdblisthub.tv.core.model.CastMember
+import com.mdblisthub.tv.core.model.Episode
+import com.mdblisthub.tv.core.model.MediaDetail
+import com.mdblisthub.tv.core.model.MediaItem
+import com.mdblisthub.tv.core.model.MediaType
+import com.mdblisthub.tv.core.model.PersonSummary
+import com.mdblisthub.tv.core.model.PlayableStream
+import com.mdblisthub.tv.core.model.ScrobbleTarget
+import com.mdblisthub.tv.core.model.SubtitleOption
+import com.mdblisthub.tv.core.model.WikipediaLookup
+import com.mdblisthub.tv.player.NO_TRACK
+import com.mdblisthub.tv.player.OfflineDownloads
+import com.mdblisthub.tv.player.OfflineMetadata
+import com.mdblisthub.tv.player.PlaybackController
+import com.mdblisthub.tv.player.PlaybackPhase
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class PlayerUiState(
+    val title: String = "",
+    val episodeLabel: String? = null,
+    val backdropUrl: String? = null,
+    val logoUrl: String? = null,
+    val overview: String? = null,
+    /** Set only while the addons are being asked, before the cascade starts. */
+    val searching: Boolean = true,
+    val subtitles: List<SubtitleOption> = emptyList(),
+    val cast: List<CastMember> = emptyList(),
+    val noAddons: Boolean = false,
+    val missingImdbId: Boolean = false,
+    /** The first deeply validated <=5 GB source should be downloaded immediately. */
+    val autoOfflineSelection: Boolean = false,
+    /** The real metadata row that follows the episode currently playing. */
+    val nextEpisode: NextEpisodeTarget? = null,
+)
+
+data class NextEpisodeTarget(
+    val season: Int,
+    val episode: Int,
+    val name: String,
+    val stillUrl: String?,
+)
+
+/** The compact biography card that follows focus in the player's cast rail. */
+data class PlayerCastPreviewState(
+    val member: CastMember? = null,
+    val loading: Boolean = false,
+    val summary: PersonSummary? = null,
+    val unavailable: Boolean = false,
+)
+
+/**
+ * Drives one playback.
+ *
+ * The order of operations is the whole user-visible design: ask the addons,
+ * rank what comes back, hand the *entire* ranked list to the controller and
+ * let it find one that works. Pressing play is the last decision the user
+ * makes — unless the cascade exhausts every candidate, at which point
+ * `PlaybackController.playManual` lets them make one more.
+ */
+class PlayerViewModel(
+    private val graph: DataGraph,
+    context: Context,
+    private val type: MediaType,
+    private val tmdbId: Int,
+    private val season: Int?,
+    private val episode: Int?,
+    // True when the user asked to pick a source up front, from the detail
+    // screen's "select source" button, instead of letting the cascade choose.
+    private val manualSelect: Boolean = false,
+    /** Selects a source for a durable download instead of opening it. */
+    private val downloadOffline: Boolean = false,
+    /** Ignores both provider progress and the exact local playback hint. */
+    private val startFromBeginning: Boolean = false,
+) : ViewModel() {
+
+    private val appContext = context.applicationContext
+    private val completionNotifier = PlaybackCompletionNotifier(appContext, type, tmdbId, season, episode)
+
+    val controller = PlaybackController(
+        context = appContext,
+        scope = viewModelScope,
+        // Same connection pool the mirror probe used, so the handshake it paid
+        // for is reused rather than repeated — see `HttpClients.playback`.
+        callFactory = graph.network.playbackClient,
+        // A torrent from its swarm keeps downloading until it is told to stop,
+        // so the engine drops it the moment the player moves to another source.
+        onSourceOpened = { stream -> TorrentStreaming.keepOnly(stream?.infoHash) },
+        // The disk read-ahead works far ahead of the picture: Wi-Fi only.
+        allowReadAhead = { !NetworkMeter.isMetered() },
+    )
+
+    init {
+        // The home screen's posters are worth ~25% of the heap and are not on
+        // screen for the next two hours; the buffer is. See `ImageMemoryTrimmer`.
+        graph.imageMemoryTrimmer.trimForPlayback()
+    }
+
+    private val _ui = MutableStateFlow(PlayerUiState())
+    val ui: StateFlow<PlayerUiState> = _ui.asStateFlow()
+
+    private val _castPreview = MutableStateFlow(PlayerCastPreviewState())
+    val castPreview: StateFlow<PlayerCastPreviewState> = _castPreview.asStateFlow()
+    private val castSummaryCache = mutableMapOf<Int, PersonSummary?>()
+    private var castPreviewJob: Job? = null
+
+    val subtitleColor: StateFlow<String> = graph.uiPreferences.subtitleColor
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "white")
+    val subtitleTextOpacity: StateFlow<Int> = graph.uiPreferences.subtitleTextOpacity
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 100)
+    val subtitleBackgroundEnabled: StateFlow<Boolean> = graph.uiPreferences.subtitleBackgroundEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+    val subtitleBackgroundOpacity: StateFlow<Int> = graph.uiPreferences.subtitleBackgroundOpacity
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 40)
+    val autoPlayNextEpisode: StateFlow<Boolean> = graph.uiPreferences.autoPlayNextEpisode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    private var target: ScrobbleTarget? = null
+    private var lastReportedProgress = 0f
+    private var playingOfflineId: String? = null
+    private var offlineDownloadStarted = false
+
+    init {
+        viewModelScope.launch { start() }
+        viewModelScope.launch { reportPlaybackToMdblist() }
+        viewModelScope.launch { keepHintCurrent() }
+        viewModelScope.launch { autoSelectAudio() }
+        viewModelScope.launch { autoSelectSubtitle() }
+    }
+
+    /**
+     * Everything needed to *start* comes from Room; everything else catches up.
+     *
+     * The order here is the whole point. Asking the addons needs an IMDb id and
+     * nothing else, and the card row — which a list sync wrote for free —
+     * already has one. Waiting for `ensureDetail` first, as this used to,
+     * meant that a cold or week-stale cache put a TMDB call plus mdblist plus
+     * OMDb in front of the first addon request, on the one screen where
+     * latency is the entire experience. Now the fan-out starts from the cached
+     * id and hydration runs beside it, only feeding the artwork on the veil.
+     */
+    private suspend fun start() {
+        // Nothing here touches the network.
+        val card = graph.media.cachedCard(type, tmdbId)
+        val cachedDetail = graph.media.cachedDetail(type, tmdbId)
+        publishArtwork(cachedDetail, card)
+
+        // Kept running past the cascade below — it is what upgrades the veil
+        // from the card's poster to a real backdrop and clearlogo.
+        val hydration = viewModelScope.async {
+            // The player now exposes cast, so its background hydration needs
+            // the complete detail record. This still runs beside source
+            // discovery and never delays playback itself.
+            graph.media.ensureCompleteDetail(type, tmdbId)
+            graph.media.cachedDetail(type, tmdbId)
+        }
+
+        // Only awaited when Room genuinely had nothing, which is the rare path
+        // (a deep link into a title that was never in a list).
+        val imdbId = card?.imdbId?.takeIf { it.isNotBlank() }
+            ?: cachedDetail?.imdbId?.takeIf { it.isNotBlank() }
+            ?: hydration.await()?.imdbId
+
+        viewModelScope.launch {
+            hydration.await()?.let { publishArtwork(it, card) }
+        }
+
+        if (type == MediaType.SHOW && season != null && episode != null) {
+            viewModelScope.launch {
+                // The common in-season answer comes from Room/TMDB season
+                // metadata and must not wait behind the heavier detail fan-
+                // out. Only retry with the freshly hydrated season index when
+                // the cached information could not name a successor.
+                val next = findNextEpisode(cachedDetail)
+                    ?: hydration.await()?.let { refreshed -> findNextEpisode(refreshed) }
+                next?.let {
+                    _ui.update { it.copy(nextEpisode = next) }
+                }
+            }
+        }
+
+        val scrobbleTarget = ScrobbleTarget(type, tmdbId, imdbId, season, episode)
+        target = scrobbleTarget
+
+        // Source-picking for a download always needs the addons. Ordinary
+        // playback checks the durable index first and can therefore start in
+        // airplane mode, before either an IMDb id or an addon is required.
+        if (!downloadOffline) {
+            val offline = OfflineDownloads.completed(type, tmdbId, season, episode)
+            if (offline != null) {
+                playingOfflineId = offline.metadata.id
+                _ui.update { it.copy(searching = false) }
+                controller.playOffline(
+                    offline,
+                    if (startFromBeginning) null else graph.playback.resumeFor(scrobbleTarget),
+                    expectedRuntimeMinutes(cachedDetail, card),
+                    // Room, not the network — the note this app left itself
+                    // last time. Null on a first watch, and everything
+                    // downstream works without one.
+                    hint = if (startFromBeginning) null else graph.playback.hintFor(scrobbleTarget),
+                )
+                return
+            }
+        }
+
+        if (imdbId.isNullOrBlank()) {
+            // Addons are indexed by IMDb id; without one there is nothing to
+            // ask, and no cascade to run.
+            _ui.update { it.copy(searching = false, missingImdbId = true) }
+            return
+        }
+
+        val stremioId = scrobbleTarget.stremioId() ?: imdbId
+
+        if (graph.addons.addons().isEmpty()) {
+            _ui.update { it.copy(searching = false, noAddons = true) }
+            return
+        }
+
+        val resumeAt = if (startFromBeginning) null else graph.playback.resumeFor(scrobbleTarget)
+        val hint = if (startFromBeginning) null else graph.playback.hintFor(scrobbleTarget)
+        val runtimeMinutes = expectedRuntimeMinutes(cachedDetail, card)
+
+        if (downloadOffline) {
+            startOfflineDownloadSelection(stremioId, runtimeMinutes)
+            return
+        }
+
+        val candidates = graph.streams.candidates(type, stremioId, runtimeMinutes)
+
+        _ui.update { it.copy(searching = false) }
+        controller.play(
+            candidates,
+            resumeAt,
+            runtimeMinutes,
+            selectManually = manualSelect,
+            // Manual selection uses the repository's normal fast discovery.
+            // Sources that fail after being picked are removed immediately.
+            validateSelectedSources = false,
+            hint = hint,
+        )
+
+        // Subtitles are fetched after playback has been handed off: they take
+        // as long as the streams did, and nothing should wait on them.
+        viewModelScope.launch {
+            val options = graph.streams.subtitles(type, stremioId)
+            _ui.update { it.copy(subtitles = options) }
+        }
+    }
+
+    /**
+     * Automatically picks the first real video whose advertised size is at
+     * most 5 GB. Discovery is allowed to finish before the list is partitioned,
+     * so a small source from a slower addon cannot arrive after the fallback
+     * has already opened. If none survives, every remaining source receives
+     * the same complete Media3 validation before the picker is shown.
+     */
+    private suspend fun startOfflineDownloadSelection(
+        stremioId: String,
+        runtimeMinutes: Int?,
+    ) {
+        runOfflineSourceFlow(
+            candidates = graph.streams.candidates(type, stremioId, runtimeMinutes),
+            validateAutomatic = { automaticSources ->
+                _ui.update { it.copy(searching = false, autoOfflineSelection = true) }
+                controller.play(
+                    automaticSources.asFlow(),
+                    expectedRuntimeMinutes = runtimeMinutes,
+                    selectManually = true,
+                    validateSelectedSources = true,
+                    stopAfterFirstValidated = true,
+                )
+
+                controller.state.first { state ->
+                    state.availableSources.isNotEmpty() || state.phase == PlaybackPhase.FAILED
+                }.availableSources.isNotEmpty()
+            },
+            validateFallback = { fallbackSources ->
+                showManualOfflineSources(fallbackSources, runtimeMinutes)
+            },
+        )
+    }
+
+    private fun showManualOfflineSources(
+        sources: List<PlayableStream>,
+        runtimeMinutes: Int?,
+    ) {
+        _ui.update { it.copy(searching = false, autoOfflineSelection = false) }
+        controller.play(
+            sources.asFlow(),
+            expectedRuntimeMinutes = runtimeMinutes,
+            selectManually = true,
+            validateSelectedSources = true,
+            stopAfterFirstValidated = false,
+        )
+    }
+
+    /** Registers the chosen source and lets DownloadService own the long transfer. */
+    fun downloadForOffline(stream: PlayableStream): Boolean {
+        if (!downloadOffline || !stream.playable || offlineDownloadStarted) return false
+        offlineDownloadStarted = true
+        val current = _ui.value
+        OfflineDownloads.enqueue(
+            appContext,
+            OfflineMetadata(
+                type = type,
+                tmdbId = tmdbId,
+                season = season,
+                episode = episode,
+                title = current.title.ifBlank { stream.title },
+                backdropUrl = current.backdropUrl,
+                stream = stream,
+            ),
+        )
+        return true
+    }
+
+    /**
+     * Whatever is known about how the title looks, from whichever source has
+     * it. Called twice — once from cache, once when hydration lands — so a
+     * later, richer answer never blanks out an earlier one.
+     */
+    private fun publishArtwork(detail: MediaDetail?, card: MediaItem?) {
+        _ui.update {
+            it.copy(
+                title = detail?.title ?: card?.title ?: it.title,
+                backdropUrl = detail?.backdropUrl ?: card?.backdropUrl ?: it.backdropUrl,
+                episodeLabel = if (type == MediaType.SHOW && season != null && episode != null) {
+                    "T${season}E$episode"
+                } else {
+                    (detail?.year ?: card?.year)?.toString() ?: it.episodeLabel
+                },
+                logoUrl = detail?.logoUrl ?: it.logoUrl,
+                overview = detail?.overview ?: it.overview,
+                cast = detail?.cast?.takeIf { members -> members.isNotEmpty() } ?: it.cast,
+            )
+        }
+    }
+
+    /**
+     * Resolves the next episode-order metadata row instead of assuming episode
+     * numbers are contiguous. When the current season ends, the first real
+     * episode in the next populated season is used, so specials and gaps do
+     * not accidentally become fabricated playback routes.
+     */
+    private suspend fun findNextEpisode(detail: MediaDetail?): NextEpisodeTarget? {
+        val currentSeason = season ?: return null
+        val currentEpisode = episode ?: return null
+
+        graph.media.ensureEpisodes(tmdbId, currentSeason)
+        nextEpisodeAfter(
+            episodes = graph.media.observeEpisodes(tmdbId, currentSeason).first(),
+            currentEpisode = currentEpisode,
+        )?.let { return it.toNextEpisodeTarget() }
+
+        val laterSeasons = detail?.seasons
+            .orEmpty()
+            .asSequence()
+            .filter { it.seasonNumber > currentSeason && it.episodeCount > 0 }
+            .sortedBy { it.seasonNumber }
+
+        for (laterSeason in laterSeasons) {
+            graph.media.ensureEpisodes(tmdbId, laterSeason.seasonNumber)
+            graph.media.observeEpisodes(tmdbId, laterSeason.seasonNumber)
+                .first()
+                .minByOrNull { it.episodeNumber }
+                ?.let { return it.toNextEpisodeTarget() }
+        }
+        return null
+    }
+
+    /**
+     * Follows D-pad focus (or a tap) without refetching a biography already
+     * seen during this playback. A late response is ignored when focus has
+     * moved to another person.
+     */
+    fun previewCast(member: CastMember) {
+        if (_castPreview.value.member?.id == member.id &&
+            (_castPreview.value.loading || _castPreview.value.summary != null || _castPreview.value.unavailable)
+        ) return
+
+        if (castSummaryCache.containsKey(member.id)) {
+            val cached = castSummaryCache[member.id]
+            _castPreview.value = PlayerCastPreviewState(
+                member = member,
+                summary = cached,
+                unavailable = cached == null,
+            )
+            return
+        }
+
+        castPreviewJob?.cancel()
+        _castPreview.value = PlayerCastPreviewState(member = member, loading = true)
+        castPreviewJob = viewModelScope.launch {
+            val lookup = graph.wikipedia.summaryFor(
+                personId = member.id,
+                name = member.name,
+                // Read here rather than held as a field: the popup is opened
+                // from the OSD long after playback started, so the cached
+                // detail is already there and a stale copy would be the only
+                // way to get this wrong.
+                releaseDate = graph.media.cachedDetail(type, tmdbId)?.releaseDate,
+                isSeries = type == MediaType.SHOW,
+            )
+            val summary = (lookup as? WikipediaLookup.Found)?.summary
+            castSummaryCache[member.id] = summary
+            _castPreview.update { current ->
+                if (current.member?.id != member.id) current
+                else PlayerCastPreviewState(
+                    member = member,
+                    summary = summary,
+                    unavailable = lookup is WikipediaLookup.NotFound,
+                )
+            }
+        }
+    }
+
+    /**
+     * How long this exact thing should run, which is what lets the controller
+     * recognise a "file removed" clip served in place of the film.
+     *
+     * For an episode the series-level runtime is useless — a 45-minute show
+     * next to a two-minute decoy is the comparison that matters, not the
+     * whole season — so the episode's own runtime is preferred and the
+     * series average is only the fallback. Returning null where nothing is
+     * known disables the check rather than letting it guess.
+     */
+    private suspend fun expectedRuntimeMinutes(detail: MediaDetail?, card: MediaItem?): Int? {
+        val seasonNumber = season
+        val episodeNumber = episode
+
+        if (type == MediaType.SHOW && seasonNumber != null && episodeNumber != null) {
+            val episodes = runCatching {
+                graph.media.observeEpisodes(tmdbId, seasonNumber).first()
+            }.getOrNull()
+
+            episodes
+                ?.firstOrNull { it.episodeNumber == episodeNumber }
+                ?.runtimeMinutes
+                ?.takeIf { it > 0 }
+                ?.let { return it }
+        }
+        // The card is the fallback rather than nothing, now that playback no
+        // longer waits for the detail row to exist: `MdbItemDto` carries a
+        // runtime, and a rough one still tells a two-minute removal notice
+        // apart from a feature.
+        return detail?.runtimeMinutes?.takeIf { it > 0 }
+            ?: card?.runtimeMinutes?.takeIf { it > 0 }
+    }
+
+    /**
+     * Keeps the local note current while nothing is transitioning.
+     *
+     * [reportPlaybackToMdblist] only wakes on a phase change, and a film
+     * watched straight through has none between the first frame and the last —
+     * where the process being killed, the handset losing power or the app
+     * being swapped away would leave the note reading zero. This is the
+     * heartbeat that makes the note survive all three; the write is one upsert
+     * into Room, so its cost at this interval is nil.
+     */
+    private suspend fun keepHintCurrent() {
+        while (true) {
+            delay(HINT_SAVE_INTERVAL_MS)
+            val current = target ?: continue
+            controller.hint()?.let { graph.playback.saveHint(current, it) }
+        }
+    }
+
+    /**
+     * mdblist owns the playback position, so every transition is reported.
+     * Past 80% it marks the title watched on its own.
+     */
+    private suspend fun reportPlaybackToMdblist() {
+        controller.state
+            .distinctUntilChangedBy { it.phase }
+            .collect { state ->
+                val current = target ?: return@collect
+                lastReportedProgress = controller.position.value.progress * 100f
+
+                // Written on the same transitions the provider is told about,
+                // because they are the same moments worth recording — and the
+                // local row is what the *next* play reads to skip the cascade
+                // and land on the exact frame. See `PlaybackHint`.
+                controller.hint()?.let { graph.playback.saveHint(current, it) }
+
+                when (state.phase) {
+                    PlaybackPhase.PLAYING -> graph.playback.start(current, lastReportedProgress)
+                    PlaybackPhase.PAUSED -> graph.playback.pause(current, lastReportedProgress)
+                    PlaybackPhase.ENDED -> {
+                        playingOfflineId?.let { offlineId ->
+                            OfflineDownloads.remove(appContext, offlineId)
+                            playingOfflineId = null
+                        }
+                        graph.playback.stop(current, lastReportedProgress)
+                        completionNotifier.show(
+                            title = _ui.value.title,
+                            episodeLabel = _ui.value.episodeLabel,
+                            languageTag = graph.uiPreferences.language.first(),
+                        )
+                    }
+                    else -> Unit
+                }
+            }
+    }
+
+    private var subtitleFetchJob: Job? = null
+
+    /**
+     * True once the *user* has touched the subtitle picker, at which point
+     * [autoSelectSubtitle] backs off permanently — nothing it could still do
+     * is worth overriding a choice someone made on purpose, even if their
+     * pick was "nenhuma".
+     */
+    private var subtitleChosenByUser = false
+
+    /** Called from the picker UI — the only caller allowed to set [subtitleChosenByUser]. */
+    fun selectSubtitle(option: SubtitleOption?) {
+        subtitleChosenByUser = true
+        applySubtitle(option)
+    }
+
+    /**
+     * The same picker's other half: a subtitle the container already carries,
+     * which needs neither a download nor a parse — the controller hands the
+     * track straight to the player's own renderer.
+     *
+     * Cancelling [subtitleFetchJob] is the part that is easy to miss. An addon
+     * subtitle already in flight would otherwise finish afterwards and replace
+     * this one, and the picker would sit there showing a choice the player had
+     * silently thrown away.
+     */
+    fun selectEmbeddedSubtitle(id: Int) {
+        subtitleChosenByUser = true
+        subtitleFetchJob?.cancel()
+        controller.selectSubtitleTrack(id)
+    }
+
+    /**
+     * Downloads and parses the file before handing it to the controller,
+     * which only ever holds cues, never a URL — see `PlaybackController`.
+     * The previous request is cancelled outright rather than raced: a user
+     * who taps through three options quickly should only ever end up with
+     * the last one they actually meant.
+     */
+    private fun applySubtitle(option: SubtitleOption?) {
+        subtitleFetchJob?.cancel()
+        if (option == null) {
+            // "Sem legenda" has to mean *neither* kind. Clearing only the
+            // external one left a container track — which ExoPlayer may have
+            // switched on by itself — still drawing captions over a film the
+            // user had just asked to have none.
+            controller.selectSubtitleTrack(NO_TRACK)
+            controller.selectExternalSubtitle(null, null)
+            return
+        }
+        subtitleFetchJob = viewModelScope.launch {
+            val track = graph.streams.subtitleTrack(option)
+            controller.selectExternalSubtitle(option, track)
+        }
+    }
+
+    /**
+     * Turns a subtitle on before anyone asks, once there is both a real
+     * playing candidate to judge a match against and a list of options to
+     * judge — see `SubtitleMatcher` for how the pick is made. Manual choice
+     * (including "nenhuma legenda") always wins if it happens first; this is
+     * a convenience, not an override.
+     */
+    private suspend fun autoSelectSubtitle() {
+        // Waits on the container's track list, not on the addon results: the
+        // two arrive at very different times, and the embedded pass below is
+        // ready long before any addon answers. `audioTracks` being non-empty is
+        // what says the list has actually been read — the same signal
+        // [autoSelectAudio] waits on, and necessary because `canShowVideo` is
+        // already true while buffering, before any track is known.
+        val playback = controller.state
+            .first { it.canShowVideo && it.audioTracks.isNotEmpty() }
+
+        if (subtitleChosenByUser) return
+
+        val preferredLang = graph.uiPreferences.subtitleLanguage.first()
+
+        // A subtitle the file already carries beats an addon match in the same
+        // language, and is tried first for two reasons: it costs no download,
+        // and it was cut against this exact release — which is the failure an
+        // addon subtitle has most often, and the reason the sync bar exists.
+        //
+        // The language code is compared with `startsWith` so "pt" matches
+        // "pt-BR", the way `SubtitleMatcher` does it; the label is a
+        // `contains` because it is free text, the way [autoSelectAudio] does
+        // it. A track with no decoder is skipped — it is in the list to be
+        // seen, not to be chosen.
+        val embedded = playback.subtitleTracks.indexOfFirst { track ->
+            track.playable && (
+                Languages.matches(track.language, preferredLang) ||
+                    track.label?.lowercase()?.contains(preferredLang) == true
+                )
+        }
+        if (embedded >= 0) {
+            // Straight to the controller, not through [selectEmbeddedSubtitle]:
+            // that one records a *user* choice, and this is the convenience
+            // that a user choice is supposed to be allowed to override.
+            controller.selectSubtitleTrack(embedded)
+            return
+        }
+
+        // Only the addon half is a download, so only it answers to the setting.
+        val autoDownload = graph.uiPreferences.subtitleAutoDownload.first()
+        if (!autoDownload) return
+
+        val uiState = ui.first { it.subtitles.isNotEmpty() }
+        if (subtitleChosenByUser) return
+
+        // Re-read rather than reused from above: the cascade may have moved to
+        // a different candidate while the addons were still answering, and the
+        // release a subtitle is matched against has to be the one playing now.
+        val playingRelease = controller.state.value.activeStream
+            ?.let { listOfNotNull(it.title, it.filename).joinToString(" ") }
+        SubtitleMatcher.bestMatch(uiState.subtitles, playingRelease, preferredLang)?.let(::applySubtitle)
+    }
+
+    private suspend fun autoSelectAudio() {
+        val playback = controller.state
+            .first { playback -> playback.canShowVideo && playback.audioTracks.isNotEmpty() }
+
+        val preferredLang = graph.uiPreferences.audioLanguage.first()
+
+        // Both the container's own label and its language code are candidates,
+        // and both are optional — a track that declares neither cannot be
+        // matched against a language preference at all.
+        //
+        // `playable` first: the track list now includes formats this device has
+        // no decoder for, so the preferred language can match one, and auto-
+        // selecting it would fail playback outright. Falling back to whatever
+        // the container chose by default is the right outcome there — the
+        // picker still shows the user why their language was skipped.
+        val trackIndex = playback.audioTracks.indexOfFirst { track ->
+            track.playable && listOfNotNull(track.label, track.language)
+                .any { it.lowercase().contains(preferredLang) }
+        }
+
+        if (trackIndex >= 0) {
+            controller.selectAudioTrack(trackIndex)
+        }
+    }
+
+    override fun onCleared() {
+        val current = target
+        val progress = controller.progressPercent().takeIf { it > 0f } ?: lastReportedProgress
+        // Read before `release()` below, which takes the position with it.
+        val hint = controller.hint()
+
+        // Fire-and-forget on the application scope: the ViewModel's own scope
+        // is already cancelled by the time this runs, and losing the stop is
+        // losing the resume point.
+        if (current != null && progress > 0f) {
+            graph.scope.launch {
+                hint?.let { graph.playback.saveHint(current, it) }
+                graph.playback.stop(current, progress)
+            }
+        }
+        controller.release()
+        graph.imageMemoryTrimmer.restore()
+        super.onCleared()
+    }
+}
+
+/**
+ * How often the local playback note is refreshed while nothing else is
+ * happening — see [PlayerViewModel.keepHintCurrent]. Half a minute is finer
+ * than anyone notices a resume being wrong by, and coarse enough that the
+ * write never competes with playback.
+ */
+private const val HINT_SAVE_INTERVAL_MS = 30_000L
+
+internal fun nextEpisodeAfter(episodes: List<Episode>, currentEpisode: Int): Episode? =
+    episodes
+        .asSequence()
+        .filter { it.episodeNumber > currentEpisode }
+        .minByOrNull { it.episodeNumber }
+
+private fun Episode.toNextEpisodeTarget() = NextEpisodeTarget(
+    season = seasonNumber,
+    episode = episodeNumber,
+    name = name,
+    stillUrl = stillUrl,
+)
